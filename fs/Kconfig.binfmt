@@ -96,6 +96,7 @@ config CORE_DUMP_DEFAULT_ELF_HEADERS
 	  This config option changes the default setting of coredump_filter
 	  seen at boot time.  If unsure, say Y.
 
+
 config BINFMT_SCRIPT
 	tristate "Kernel support for scripts starting with #!"
 	default y

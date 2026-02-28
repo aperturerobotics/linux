@@ -14,5 +14,6 @@ extern int host_random(void *buf, int len);
 extern void host_yield(void);
 extern void host_exit(int code);
 extern void host_panic(const char *msg);
+extern void host_load_executable(unsigned long code_ptr, unsigned long code_len);
 
 #endif

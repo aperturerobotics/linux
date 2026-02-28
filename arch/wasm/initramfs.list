@@ -1,0 +1,4 @@
+# Minimal WASM initramfs
+dir /dev 0755 0 0
+nod /dev/console 0622 0 0 c 5 1
+file /init arch/wasm/initramfs/init 0755 0 0

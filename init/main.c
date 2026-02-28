@@ -711,7 +711,7 @@ static void __init setup_command_line(char *command_line)
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
 
-static noinline void __ref __noreturn rest_init(void)
+noinline void __ref __noreturn rest_init(void)
 {
 	struct task_struct *tsk;
 	int pid;
@@ -798,6 +798,16 @@ void __init parse_early_param(void)
 }
 
 void __init __weak arch_post_acpi_subsys_init(void) { }
+
+#ifdef CONFIG_WASM
+extern void __init __noreturn arch_call_rest_init(void);
+#else
+extern void __noreturn rest_init(void);
+static void __init __noreturn arch_call_rest_init(void)
+{
+	rest_init();
+}
+#endif
 
 void __init __weak smp_setup_processor_id(void)
 {
@@ -1207,7 +1217,7 @@ void start_kernel(void)
 	kcsan_init();
 
 	/* Do the rest non-__init'ed, we're now alive */
-	rest_init();
+	arch_call_rest_init();
 
 	/*
 	 * Avoid stack canaries in callers of boot_init_stack_canary for gcc-10
@@ -1721,3 +1731,4 @@ static noinline void __init kernel_init_freeable(void)
 
 	integrity_load_keys();
 }
+
