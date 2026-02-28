@@ -300,6 +300,11 @@ config TRACE_IRQFLAGS_SUPPORT
 config TRACE_IRQFLAGS_NMI_SUPPORT
 	bool
 
+
+config NO_IP
+	bool
+	help
+	  Enable for architectures without (visible) instruction pointer.
 #
 # An arch should select this if it provides all these things:
 #

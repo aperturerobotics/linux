@@ -15,6 +15,7 @@
 
 #include <linux/compiler.h>
 #include <linux/kcsan-checks.h>
+#include <asm/processor.h>
 #include <asm/rwonce.h>
 
 #ifndef nop

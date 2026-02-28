@@ -892,7 +892,8 @@
 /* Built-in firmware blobs */
 #ifdef CONFIG_FW_LOADER
 #define FW_LOADER_BUILT_IN_DATA						\
-	.builtin_fw : AT(ADDR(.builtin_fw) - LOAD_OFFSET) ALIGN(8) {	\
+	. = ALIGN(8);							\
+	.builtin_fw : AT(ADDR(.builtin_fw) - LOAD_OFFSET) {		\
 		BOUNDED_SECTION_PRE_LABEL(.builtin_fw, _builtin_fw, __start, __end) \
 	}
 #else

@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menu "Wasm-specific options"
+
+config WASM
+	bool
+	default y
+	select ARCH_NO_PREEMPT
+	select THREAD_INFO_IN_TASK
+	select NO_IP
+	select UACCESS_MEMCPY
+	select GENERIC_CPU_DEVICES
+	select GENERIC_ENTRY
+	select GENERIC_IRQ_SHOW
+	select HAVE_SYSCALL_TRACEPOINTS
+	select ARCH_USE_BUILTIN_BSWAP
+	select GENERIC_ATOMIC64
+	select SPARSE_IRQ
+	select OF_EARLY_FLATTREE if OF
+	select ARCH_32BIT_OFF_T
+
+config MMU
+	bool
+	default n
+
+config GENERIC_HWEIGHT
+	def_bool y
+
+config GENERIC_CSUM
+	def_bool y
+
+config NO_IOPORT_MAP
+	def_bool y
+
+config HZ
+	int
+	default 100
+
+config NR_IRQS
+	int
+	default 32
+
+endmenu

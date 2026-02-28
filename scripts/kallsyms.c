@@ -277,11 +277,16 @@ static void read_map(const char *in)
 	fclose(fp);
 }
 
-static void output_label(const char *label)
+static void output_label_begin(const char *label)
 {
 	printf(".globl %s\n", label);
 	printf("\t.balign 4\n");
 	printf("%s:\n", label);
+}
+
+static void output_label_end(const char *label)
+{
+	printf(".size\t%s,.-%s\n", label, label);
 }
 
 /* uncompress a compressed symbol. When this function is called, the best table
@@ -343,10 +348,11 @@ static void write_src(void)
 	unsigned int *markers, markers_cnt;
 	char buf[KSYM_NAME_LEN];
 
-	printf("\t.section .rodata, \"a\"\n");
+	printf("\t.section .rodata, \"\", @\n");
 
-	output_label("kallsyms_num_syms");
+	output_label_begin("kallsyms_num_syms");
 	printf("\t.long\t%u\n", table_cnt);
+	output_label_end("kallsyms_num_syms");
 	printf("\n");
 
 	/* table of offset markers, that give the offset in the compressed stream
@@ -354,7 +360,7 @@ static void write_src(void)
 	markers_cnt = (table_cnt + 255) / 256;
 	markers = xmalloc(sizeof(*markers) * markers_cnt);
 
-	output_label("kallsyms_names");
+	output_label_begin("kallsyms_names");
 	off = 0;
 	for (i = 0; i < table_cnt; i++) {
 		if ((i & 0xFF) == 0)
@@ -398,16 +404,18 @@ static void write_src(void)
 		strcpy((char *)table[i]->sym, buf);
 		printf("\t/* %s */\n", table[i]->sym);
 	}
+	output_label_end("kallsyms_names");
 	printf("\n");
 
-	output_label("kallsyms_markers");
+	output_label_begin("kallsyms_markers");
 	for (i = 0; i < markers_cnt; i++)
 		printf("\t.long\t%u\n", markers[i]);
+	output_label_end("kallsyms_markers");
 	printf("\n");
 
 	free(markers);
 
-	output_label("kallsyms_token_table");
+	output_label_begin("kallsyms_token_table");
 	off = 0;
 	for (i = 0; i < 256; i++) {
 		best_idx[i] = off;
@@ -415,14 +423,16 @@ static void write_src(void)
 		printf("\t.asciz\t\"%s\"\n", buf);
 		off += strlen(buf) + 1;
 	}
+	output_label_end("kallsyms_token_table");
 	printf("\n");
 
-	output_label("kallsyms_token_index");
+	output_label_begin("kallsyms_token_index");
 	for (i = 0; i < 256; i++)
 		printf("\t.short\t%d\n", best_idx[i]);
+	output_label_end("kallsyms_token_index");
 	printf("\n");
 
-	output_label("kallsyms_offsets");
+	output_label_begin("kallsyms_offsets");
 
 	for (i = 0; i < table_cnt; i++) {
 		if (pc_relative) {
@@ -441,16 +451,18 @@ static void write_src(void)
 			       (unsigned int)table[i]->addr, table[i]->sym);
 		}
 	}
+	output_label_end("kallsyms_offsets");
 	printf("\n");
 
 	sort_symbols_by_name();
-	output_label("kallsyms_seqs_of_names");
+	output_label_begin("kallsyms_seqs_of_names");
 	for (i = 0; i < table_cnt; i++)
 		printf("\t.byte 0x%02x, 0x%02x, 0x%02x\t/* %s */\n",
 			(unsigned char)(table[i]->seq >> 16),
 			(unsigned char)(table[i]->seq >> 8),
 			(unsigned char)(table[i]->seq >> 0),
 		       table[i]->sym);
+	output_label_end("kallsyms_seqs_of_names");
 	printf("\n");
 }
 

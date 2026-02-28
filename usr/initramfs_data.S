@@ -22,11 +22,13 @@
   in the ELF header, as required by certain architectures.
 */
 
-.section .init.ramfs,"a"
+.section .init.ramfs,"",@
 __irf_start:
 .incbin "usr/initramfs_inc_data"
+.size __irf_start,.-__irf_start
 __irf_end:
-.section .init.ramfs.info,"a"
+.size __irf_end,0
+.section .init.ramfs.info,"",@
 .globl __initramfs_size
 __initramfs_size:
 #ifdef CONFIG_64BIT
@@ -34,3 +36,4 @@ __initramfs_size:
 #else
 	.long __irf_end - __irf_start
 #endif
+.size __initramfs_size,.-__initramfs_size
