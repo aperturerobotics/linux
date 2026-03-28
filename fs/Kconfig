@@ -412,6 +412,7 @@ source "fs/smb/Kconfig"
 source "fs/coda/Kconfig"
 source "fs/afs/Kconfig"
 source "fs/9p/Kconfig"
+source "fs/v86fs/Kconfig"
 
 endif # NETWORK_FILESYSTEMS
 
