@@ -33,12 +33,18 @@
 #define V86FS_MSG_LOOKUP    0x01
 #define V86FS_MSG_GETATTR   0x02
 #define V86FS_MSG_READDIR   0x03
+#define V86FS_MSG_OPEN      0x04
+#define V86FS_MSG_CLOSE     0x05
+#define V86FS_MSG_READ      0x06
 
 /* Response types (type | 0x80) */
 #define V86FS_MSG_MOUNT_R   0x80
 #define V86FS_MSG_LOOKUP_R  0x81
 #define V86FS_MSG_GETATTR_R 0x82
 #define V86FS_MSG_READDIR_R 0x83
+#define V86FS_MSG_OPEN_R    0x84
+#define V86FS_MSG_CLOSE_R   0x85
+#define V86FS_MSG_READ_R    0x86
 #define V86FS_MSG_ERROR_R   0xFF
 
 /* Status codes */
@@ -69,6 +75,11 @@ struct v86fs_sb_info {
 	u64 root_inode_id;
 };
 
+/* Per-open-file data */
+struct v86fs_file_info {
+	u64 handle_id;
+};
+
 /* Global device pointer (single device supported for now) */
 static struct v86fs_device *v86fs_dev;
 
@@ -91,6 +102,14 @@ static void v86fs_pack_u16(u8 *buf, u16 val)
 {
 	buf[0] = val & 0xFF;
 	buf[1] = (val >> 8) & 0xFF;
+}
+
+static void v86fs_pack_u32(u8 *buf, u32 val)
+{
+	buf[0] = val & 0xFF;
+	buf[1] = (val >> 8) & 0xFF;
+	buf[2] = (val >> 16) & 0xFF;
+	buf[3] = (val >> 24) & 0xFF;
 }
 
 static void v86fs_pack_u64(u8 *buf, u64 val)
@@ -215,6 +234,9 @@ static struct dentry *v86fs_lookup(struct inode *, struct dentry *,
 static int v86fs_readdir(struct file *, struct dir_context *);
 static int v86fs_getattr(struct mnt_idmap *, const struct path *,
 			 struct kstat *, u32, unsigned int);
+static int v86fs_open(struct inode *, struct file *);
+static int v86fs_release(struct inode *, struct file *);
+static int v86fs_read_folio(struct file *, struct folio *);
 
 static const struct inode_operations v86fs_dir_inode_ops = {
 	.lookup		= v86fs_lookup,
@@ -229,6 +251,17 @@ static const struct file_operations v86fs_dir_fops = {
 	.read		= generic_read_dir,
 	.iterate_shared	= v86fs_readdir,
 	.llseek		= generic_file_llseek,
+};
+
+static const struct file_operations v86fs_file_fops = {
+	.open		= v86fs_open,
+	.release	= v86fs_release,
+	.read_iter	= generic_file_read_iter,
+	.llseek		= generic_file_llseek,
+};
+
+static const struct address_space_operations v86fs_aops = {
+	.read_folio	= v86fs_read_folio,
 };
 
 static struct inode *v86fs_make_inode(struct super_block *sb, u64 ino,
@@ -252,6 +285,8 @@ static struct inode *v86fs_make_inode(struct super_block *sb, u64 ino,
 		break;
 	case S_IFREG:
 		inode->i_op = &v86fs_file_inode_ops;
+		inode->i_fop = &v86fs_file_fops;
+		inode->i_data.a_ops = &v86fs_aops;
 		break;
 	}
 
@@ -260,10 +295,6 @@ static struct inode *v86fs_make_inode(struct super_block *sb, u64 ino,
 
 /*
  * LOOKUP: resolve a child name in a directory.
- * Sends LOOKUP on hipriq, creates inode from response.
- *
- * LOOKUP request:  [7B hdr] [8B parent_id] [2B name_len] [name...]
- * LOOKUP_R reply:  [7B hdr] [4B status] [8B inode_id] [4B mode] [8B size]
  */
 static struct dentry *v86fs_lookup(struct inode *dir, struct dentry *dentry,
 				   unsigned int flags)
@@ -318,11 +349,6 @@ static struct dentry *v86fs_lookup(struct inode *dir, struct dentry *dentry,
 
 /*
  * READDIR: list entries in a directory.
- * Sends READDIR on requestq, emits entries via dir_context.
- *
- * READDIR request:  [7B hdr] [8B dir_id]
- * READDIR_R reply:  [7B hdr] [4B status] [4B count]
- *   per entry:      [8B inode_id] [1B type] [2B name_len] [name...]
  */
 static int v86fs_readdir(struct file *file, struct dir_context *ctx)
 {
@@ -345,7 +371,6 @@ static int v86fs_readdir(struct file *file, struct dir_context *ctx)
 		return -ENOMEM;
 	}
 
-	/* Build READDIR: [7B hdr] [8B dir_id] */
 	total_len = V86FS_HDR_SIZE + 8;
 	v86fs_pack_header(req, total_len, V86FS_MSG_READDIR, 0);
 	v86fs_pack_u64(&req[7], dir->i_ino);
@@ -369,8 +394,8 @@ static int v86fs_readdir(struct file *file, struct dir_context *ctx)
 	}
 
 	count = v86fs_read_u32(&resp[11]);
-	buf_off = 15; /* after hdr(7) + status(4) + count(4) */
-	entry_pos = 2; /* after . and .. */
+	buf_off = 15;
+	entry_pos = 2;
 
 	for (i = 0; i < count; i++) {
 		u64 ino;
@@ -408,11 +433,6 @@ out:
 
 /*
  * GETATTR: get inode attributes from host.
- * Sends GETATTR on hipriq, updates inode stat.
- *
- * GETATTR request:  [7B hdr] [8B inode_id]
- * GETATTR_R reply:  [7B hdr] [4B status] [4B mode] [8B size]
- *                   [8B mtime_sec] [4B mtime_nsec]
  */
 static int v86fs_getattr(struct mnt_idmap *idmap, const struct path *path,
 			 struct kstat *stat, u32 request_mask,
@@ -455,6 +475,163 @@ static int v86fs_getattr(struct mnt_idmap *idmap, const struct path *path,
 
 	generic_fillattr(idmap, request_mask, inode, stat);
 	return 0;
+}
+
+/*
+ * OPEN: open a file on the host, get a handle ID.
+ * OPEN request:  [7B hdr] [8B inode_id] [4B flags]
+ * OPEN_R reply:  [7B hdr] [4B status] [8B handle_id]
+ */
+static int v86fs_open(struct inode *inode, struct file *file)
+{
+	struct v86fs_sb_info *sbi = inode->i_sb->s_fs_info;
+	u8 req[V86FS_HDR_SIZE + 8 + 4];
+	u8 resp[32];
+	struct v86fs_file_info *fi;
+	u32 total_len, status;
+	int err;
+
+	fi = kzalloc(sizeof(*fi), GFP_KERNEL);
+	if (!fi)
+		return -ENOMEM;
+
+	total_len = V86FS_HDR_SIZE + 8 + 4;
+	v86fs_pack_header(req, total_len, V86FS_MSG_OPEN, 0);
+	v86fs_pack_u64(&req[7], inode->i_ino);
+	v86fs_pack_u32(&req[15], file->f_flags);
+
+	memset(resp, 0, sizeof(resp));
+	err = v86fs_request(sbi->v86dev, V86FS_VQ_HIPRIQ,
+			    req, total_len, resp, sizeof(resp));
+	if (err) {
+		kfree(fi);
+		return err;
+	}
+
+	if (resp[4] != V86FS_MSG_OPEN_R) {
+		kfree(fi);
+		return -EIO;
+	}
+
+	status = v86fs_read_u32(&resp[7]);
+	if (status != V86FS_STATUS_OK) {
+		kfree(fi);
+		return -EIO;
+	}
+
+	fi->handle_id = v86fs_read_u64(&resp[11]);
+	file->private_data = fi;
+	return 0;
+}
+
+/*
+ * CLOSE: release a file handle on the host.
+ * CLOSE request: [7B hdr] [8B handle_id]
+ * CLOSE_R reply: [7B hdr] [4B status]
+ */
+static int v86fs_release(struct inode *inode, struct file *file)
+{
+	struct v86fs_sb_info *sbi = inode->i_sb->s_fs_info;
+	struct v86fs_file_info *fi = file->private_data;
+	u8 req[V86FS_HDR_SIZE + 8];
+	u8 resp[32];
+	u32 total_len;
+
+	if (!fi)
+		return 0;
+
+	total_len = V86FS_HDR_SIZE + 8;
+	v86fs_pack_header(req, total_len, V86FS_MSG_CLOSE, 0);
+	v86fs_pack_u64(&req[7], fi->handle_id);
+
+	memset(resp, 0, sizeof(resp));
+	v86fs_request(sbi->v86dev, V86FS_VQ_HIPRIQ,
+		      req, total_len, resp, sizeof(resp));
+
+	kfree(fi);
+	file->private_data = NULL;
+	return 0;
+}
+
+/*
+ * READ: read file data via page cache.
+ * READ request:  [7B hdr] [8B handle_id] [8B offset] [4B size]
+ * READ_R reply:  [7B hdr] [4B status] [4B bytes_read] [data...]
+ */
+static int v86fs_read_folio(struct file *file, struct folio *folio)
+{
+	struct inode *inode = folio->mapping->host;
+	struct v86fs_sb_info *sbi = inode->i_sb->s_fs_info;
+	struct v86fs_file_info *fi = file ? file->private_data : NULL;
+	u8 *req, *resp;
+	u32 total_len, status, bytes_read;
+	loff_t pos = folio_pos(folio);
+	size_t len = folio_size(folio);
+	int err;
+
+	/* Cap read to file size */
+	if (pos >= i_size_read(inode)) {
+		folio_zero_range(folio, 0, len);
+		folio_mark_uptodate(folio);
+		folio_unlock(folio);
+		return 0;
+	}
+	if (pos + len > i_size_read(inode))
+		len = i_size_read(inode) - pos;
+
+	req = kmalloc(V86FS_HDR_SIZE + 8 + 8 + 4, GFP_KERNEL);
+	resp = kmalloc(V86FS_MSG_MAX, GFP_KERNEL);
+	if (!req || !resp) {
+		kfree(req);
+		kfree(resp);
+		folio_unlock(folio);
+		return -ENOMEM;
+	}
+
+	total_len = V86FS_HDR_SIZE + 8 + 8 + 4;
+	v86fs_pack_header(req, total_len, V86FS_MSG_READ, 0);
+	v86fs_pack_u64(&req[7], fi ? fi->handle_id : inode->i_ino);
+	v86fs_pack_u64(&req[15], pos);
+	v86fs_pack_u32(&req[23], len);
+
+	memset(resp, 0, V86FS_MSG_MAX);
+	err = v86fs_request(sbi->v86dev, V86FS_VQ_REQUESTQ,
+			    req, total_len, resp, V86FS_MSG_MAX);
+	if (err)
+		goto out_err;
+
+	if (resp[4] != V86FS_MSG_READ_R) {
+		err = -EIO;
+		goto out_err;
+	}
+
+	status = v86fs_read_u32(&resp[7]);
+	if (status != V86FS_STATUS_OK) {
+		err = -EIO;
+		goto out_err;
+	}
+
+	bytes_read = v86fs_read_u32(&resp[11]);
+	if (bytes_read > len)
+		bytes_read = len;
+
+	/* Copy data into the folio */
+	memcpy_to_folio(folio, 0, &resp[15], bytes_read);
+	if (bytes_read < folio_size(folio))
+		folio_zero_range(folio, bytes_read,
+				 folio_size(folio) - bytes_read);
+
+	folio_mark_uptodate(folio);
+	folio_unlock(folio);
+	kfree(req);
+	kfree(resp);
+	return 0;
+
+out_err:
+	folio_unlock(folio);
+	kfree(req);
+	kfree(resp);
+	return err;
 }
 
 enum v86fs_param {
@@ -515,7 +692,6 @@ static int v86fs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_time_gran	= 1;
 	sb->s_fs_info	= sbi;
 
-	/* Send MOUNT message to host */
 	err = v86fs_mount_request(sbi->v86dev, opts->root_name,
 				  &root_id, &root_mode);
 	if (err) {
