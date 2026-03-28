@@ -44,6 +44,10 @@
 #define V86FS_MSG_READLINK  0x0F
 #define V86FS_MSG_STATFS    0x10
 
+/* Notifyq push messages (host -> guest) */
+#define V86FS_MSG_INVALIDATE     0x20
+#define V86FS_MSG_INVALIDATE_DIR 0x21
+
 #define V86FS_MSG_MOUNT_R   0x80
 #define V86FS_MSG_LOOKUP_R  0x81
 #define V86FS_MSG_GETATTR_R 0x82
@@ -66,10 +70,13 @@
 #define V86FS_STATUS_ENOENT 2
 #define V86FS_HDR_SIZE      7
 
+#define V86FS_NOTIFY_BUF_SIZE 64
+#define V86FS_NOTIFY_BUF_COUNT 16
+
 struct v86fs_device {
 	struct virtio_device *vdev;
 	struct virtqueue *vqs[V86FS_VQ_MAX];
-	struct mutex req_lock;
+	struct mutex req_lock; /* serializes hipriq/requestq */
 	struct completion req_done;
 };
 
@@ -78,6 +85,7 @@ struct v86fs_sb_info { struct v86fs_device *v86dev; u64 root_inode_id; };
 struct v86fs_file_info { u64 handle_id; };
 
 static struct v86fs_device *v86fs_dev;
+static struct super_block *v86fs_sb; /* for inode lookup in notifyq */
 
 static void v86fs_pack_header(u8 *buf, u32 length, u8 type, u16 tag)
 {
@@ -227,9 +235,9 @@ static const struct address_space_operations v86fs_aops = {
 
 static struct inode *v86fs_make_inode(struct super_block *sb, u64 ino, umode_t mode)
 {
-	struct inode *inode = new_inode(sb);
+	struct inode *inode = iget_locked(sb, ino);
 	if (!inode) return NULL;
-	inode->i_ino = ino;
+	if (!(inode_state_read_once(inode) & I_NEW)) return inode;
 	inode->i_mode = mode;
 	simple_inode_init_ts(inode);
 	switch (mode & S_IFMT) {
@@ -247,6 +255,7 @@ static struct inode *v86fs_make_inode(struct super_block *sb, u64 ino, umode_t m
 		inode->i_op = &v86fs_symlink_inode_ops;
 		break;
 	}
+	unlock_new_inode(inode);
 	return inode;
 }
 
@@ -746,6 +755,7 @@ static int v86fs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!root_inode) { kfree(sbi); return -ENOMEM; }
 	sb->s_root = d_make_root(root_inode);
 	if (!sb->s_root) { kfree(sbi); return -ENOMEM; }
+	v86fs_sb = sb;
 	return 0;
 }
 
@@ -770,7 +780,7 @@ static int v86fs_init_fs_context(struct fs_context *fc)
 }
 
 static void v86fs_kill_sb(struct super_block *sb)
-{ kill_anon_super(sb); kfree(sb->s_fs_info); }
+{ v86fs_sb = NULL; kill_anon_super(sb); kfree(sb->s_fs_info); }
 
 static struct file_system_type v86fs_type = {
 	.name = "v86fs", .init_fs_context = v86fs_init_fs_context,
@@ -783,6 +793,66 @@ static void v86fs_vq_done(struct virtqueue *vq)
 	struct v86fs_device *v86dev = vq->vdev->priv;
 	unsigned int len; while (virtqueue_get_buf(vq, &len)) ;
 	complete(&v86dev->req_done);
+}
+
+
+static void v86fs_notifyq_repost(struct virtqueue *vq, void *buf)
+{
+	struct scatterlist sg;
+	sg_init_one(&sg, buf, V86FS_NOTIFY_BUF_SIZE);
+	virtqueue_add_inbuf(vq, &sg, 1, buf, GFP_ATOMIC);
+}
+
+static void v86fs_notifyq_done(struct virtqueue *vq)
+{
+	struct super_block *sb = v86fs_sb;
+	unsigned int len;
+	void *buf;
+
+	while ((buf = virtqueue_get_buf(vq, &len))) {
+		u8 *msg = buf;
+		u8 type;
+		u64 ino;
+		struct inode *inode;
+
+		if (len < V86FS_HDR_SIZE + 8) goto repost;
+		type = msg[4];
+		ino = v86fs_read_u64(&msg[7]);
+		if (!sb) goto repost;
+
+		inode = ilookup(sb, ino);
+		if (!inode) goto repost;
+
+		switch (type) {
+		case V86FS_MSG_INVALIDATE:
+			invalidate_inode_pages2(inode->i_mapping);
+			break;
+		case V86FS_MSG_INVALIDATE_DIR:
+			if (S_ISDIR(inode->i_mode)) {
+				struct dentry *dentry = d_find_any_alias(inode);
+				if (dentry) {
+					d_invalidate(dentry);
+					dput(dentry);
+				}
+			}
+			break;
+		}
+		iput(inode);
+repost:
+		v86fs_notifyq_repost(vq, buf);
+	}
+	virtqueue_kick(vq);
+}
+
+static void v86fs_notifyq_fill(struct virtqueue *vq)
+{
+	int i;
+	for (i = 0; i < V86FS_NOTIFY_BUF_COUNT; i++) {
+		void *buf = kzalloc(V86FS_NOTIFY_BUF_SIZE, GFP_KERNEL);
+		if (!buf) break;
+		v86fs_notifyq_repost(vq, buf);
+	}
+	virtqueue_kick(vq);
 }
 
 static int v86fs_probe(struct virtio_device *vdev)
@@ -800,12 +870,13 @@ static int v86fs_probe(struct virtio_device *vdev)
 
 	vqs_info[0].callback = v86fs_vq_done; vqs_info[0].name = "hipriq";
 	vqs_info[1].callback = v86fs_vq_done; vqs_info[1].name = "requestq";
-	vqs_info[2].callback = v86fs_vq_done; vqs_info[2].name = "notifyq";
+	vqs_info[2].callback = v86fs_notifyq_done; vqs_info[2].name = "notifyq";
 	err = virtio_find_vqs(vdev, V86FS_VQ_MAX, vqs, vqs_info, NULL);
 	if (err) { kfree(v86dev); return err; }
 	v86dev->vqs[0] = vqs[0]; v86dev->vqs[1] = vqs[1]; v86dev->vqs[2] = vqs[2];
 
 	virtio_device_ready(vdev);
+	v86fs_notifyq_fill(vqs[2]);
 	v86fs_dev = v86dev;
 	pr_info("v86fs: probed, %d virtqueues ready\n", V86FS_VQ_MAX);
 	return 0;
