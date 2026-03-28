@@ -73,11 +73,20 @@
 #define V86FS_NOTIFY_BUF_SIZE 64
 #define V86FS_NOTIFY_BUF_COUNT 16
 
+#define V86FS_TAG_COUNT 256
+
+struct v86fs_tag_slot {
+	struct completion done;
+	void *resp_buf;
+	u32 resp_len;
+};
+
 struct v86fs_device {
 	struct virtio_device *vdev;
 	struct virtqueue *vqs[V86FS_VQ_MAX];
-	struct mutex req_lock; /* serializes hipriq/requestq */
-	struct completion req_done;
+	struct mutex vq_lock[V86FS_VQ_MAX]; /* per-queue submission lock */
+	atomic_t next_tag;
+	struct v86fs_tag_slot tags[V86FS_TAG_COUNT];
 };
 
 struct v86fs_mount_opts { char *root_name; };
@@ -117,6 +126,11 @@ static u32 v86fs_read_u32(const u8 *buf)
 static u64 v86fs_read_u64(const u8 *buf)
 { return (u64)v86fs_read_u32(buf) | ((u64)v86fs_read_u32(buf + 4) << 32); }
 
+static u16 v86fs_alloc_tag(struct v86fs_device *v86dev)
+{
+	return (u16)(atomic_inc_return(&v86dev->next_tag) & (V86FS_TAG_COUNT - 1));
+}
+
 static int v86fs_request(struct v86fs_device *v86dev, int queue_id,
 			 void *req_buf, u32 req_len,
 			 void *resp_buf, u32 resp_len)
@@ -124,18 +138,31 @@ static int v86fs_request(struct v86fs_device *v86dev, int queue_id,
 	struct virtqueue *vq = v86dev->vqs[queue_id];
 	struct scatterlist sg_out, sg_in;
 	struct scatterlist *sgs[2];
+	u16 tag;
+	struct v86fs_tag_slot *slot;
 	int err;
 
-	mutex_lock(&v86dev->req_lock);
-	reinit_completion(&v86dev->req_done);
+	tag = v86fs_alloc_tag(v86dev);
+	slot = &v86dev->tags[tag];
+	slot->resp_buf = resp_buf;
+	slot->resp_len = resp_len;
+	reinit_completion(&slot->done);
+
+	/* Write tag into request header bytes 5-6 */
+	((u8 *)req_buf)[5] = tag & 0xFF;
+	((u8 *)req_buf)[6] = (tag >> 8) & 0xFF;
+
 	sg_init_one(&sg_out, req_buf, req_len);
 	sg_init_one(&sg_in, resp_buf, resp_len);
 	sgs[0] = &sg_out; sgs[1] = &sg_in;
-	err = virtqueue_add_sgs(vq, sgs, 1, 1, v86dev, GFP_KERNEL);
-	if (err) { mutex_unlock(&v86dev->req_lock); return err; }
+
+	mutex_lock(&v86dev->vq_lock[queue_id]);
+	err = virtqueue_add_sgs(vq, sgs, 1, 1, slot, GFP_KERNEL);
+	if (err) { mutex_unlock(&v86dev->vq_lock[queue_id]); return err; }
 	virtqueue_kick(vq);
-	wait_for_completion(&v86dev->req_done);
-	mutex_unlock(&v86dev->req_lock);
+	mutex_unlock(&v86dev->vq_lock[queue_id]);
+
+	wait_for_completion(&slot->done);
 	return 0;
 }
 
@@ -790,9 +817,11 @@ static struct file_system_type v86fs_type = {
 /* Virtio device */
 static void v86fs_vq_done(struct virtqueue *vq)
 {
-	struct v86fs_device *v86dev = vq->vdev->priv;
-	unsigned int len; while (virtqueue_get_buf(vq, &len)) ;
-	complete(&v86dev->req_done);
+	unsigned int len;
+	struct v86fs_tag_slot *slot;
+
+	while ((slot = virtqueue_get_buf(vq, &len)) != NULL)
+		complete(&slot->done);
 }
 
 
@@ -865,8 +894,14 @@ static int v86fs_probe(struct virtio_device *vdev)
 	v86dev = kzalloc(sizeof(*v86dev), GFP_KERNEL);
 	if (!v86dev) return -ENOMEM;
 	v86dev->vdev = vdev; vdev->priv = v86dev;
-	mutex_init(&v86dev->req_lock);
-	init_completion(&v86dev->req_done);
+	atomic_set(&v86dev->next_tag, 0);
+	{
+		int i;
+		for (i = 0; i < V86FS_VQ_MAX; i++)
+			mutex_init(&v86dev->vq_lock[i]);
+		for (i = 0; i < V86FS_TAG_COUNT; i++)
+			init_completion(&v86dev->tags[i].done);
+	}
 
 	vqs_info[0].callback = v86fs_vq_done; vqs_info[0].name = "hipriq";
 	vqs_info[1].callback = v86fs_vq_done; vqs_info[1].name = "requestq";
