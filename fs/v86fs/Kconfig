@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config V86_FS
+	bool "v86 Host Filesystem (v86fs)"
+	depends on VIRTIO
+	help
+	  v86fs provides a high-performance filesystem for v86 emulated
+	  guests, using a custom virtio device to access host filesystem
+	  handles directly via DMA.
+
+	  If unsure, say N.
