@@ -44,6 +44,10 @@
 #define V86FS_MSG_READLINK  0x0F
 #define V86FS_MSG_STATFS    0x10
 
+/* Notifyq push messages (host -> guest) */
+#define V86FS_MSG_INVALIDATE     0x20
+#define V86FS_MSG_INVALIDATE_DIR 0x21
+
 #define V86FS_MSG_MOUNT_R   0x80
 #define V86FS_MSG_LOOKUP_R  0x81
 #define V86FS_MSG_GETATTR_R 0x82
@@ -66,11 +70,23 @@
 #define V86FS_STATUS_ENOENT 2
 #define V86FS_HDR_SIZE      7
 
+#define V86FS_NOTIFY_BUF_SIZE 64
+#define V86FS_NOTIFY_BUF_COUNT 16
+
+#define V86FS_TAG_COUNT 256
+
+struct v86fs_tag_slot {
+	struct completion done;
+	void *resp_buf;
+	u32 resp_len;
+};
+
 struct v86fs_device {
 	struct virtio_device *vdev;
 	struct virtqueue *vqs[V86FS_VQ_MAX];
-	struct mutex req_lock;
-	struct completion req_done;
+	struct mutex vq_lock[V86FS_VQ_MAX]; /* per-queue submission lock */
+	atomic_t next_tag;
+	struct v86fs_tag_slot tags[V86FS_TAG_COUNT];
 };
 
 struct v86fs_mount_opts { char *root_name; };
@@ -78,6 +94,7 @@ struct v86fs_sb_info { struct v86fs_device *v86dev; u64 root_inode_id; };
 struct v86fs_file_info { u64 handle_id; };
 
 static struct v86fs_device *v86fs_dev;
+static struct super_block *v86fs_sb; /* for inode lookup in notifyq */
 
 static void v86fs_pack_header(u8 *buf, u32 length, u8 type, u16 tag)
 {
@@ -109,6 +126,11 @@ static u32 v86fs_read_u32(const u8 *buf)
 static u64 v86fs_read_u64(const u8 *buf)
 { return (u64)v86fs_read_u32(buf) | ((u64)v86fs_read_u32(buf + 4) << 32); }
 
+static u16 v86fs_alloc_tag(struct v86fs_device *v86dev)
+{
+	return (u16)(atomic_inc_return(&v86dev->next_tag) & (V86FS_TAG_COUNT - 1));
+}
+
 static int v86fs_request(struct v86fs_device *v86dev, int queue_id,
 			 void *req_buf, u32 req_len,
 			 void *resp_buf, u32 resp_len)
@@ -116,19 +138,74 @@ static int v86fs_request(struct v86fs_device *v86dev, int queue_id,
 	struct virtqueue *vq = v86dev->vqs[queue_id];
 	struct scatterlist sg_out, sg_in;
 	struct scatterlist *sgs[2];
+	u16 tag;
+	struct v86fs_tag_slot *slot;
 	int err;
 
-	mutex_lock(&v86dev->req_lock);
-	reinit_completion(&v86dev->req_done);
+	tag = v86fs_alloc_tag(v86dev);
+	slot = &v86dev->tags[tag];
+	slot->resp_buf = resp_buf;
+	slot->resp_len = resp_len;
+	reinit_completion(&slot->done);
+
+	/* Write tag into request header bytes 5-6 */
+	((u8 *)req_buf)[5] = tag & 0xFF;
+	((u8 *)req_buf)[6] = (tag >> 8) & 0xFF;
+
 	sg_init_one(&sg_out, req_buf, req_len);
 	sg_init_one(&sg_in, resp_buf, resp_len);
 	sgs[0] = &sg_out; sgs[1] = &sg_in;
-	err = virtqueue_add_sgs(vq, sgs, 1, 1, v86dev, GFP_KERNEL);
-	if (err) { mutex_unlock(&v86dev->req_lock); return err; }
+
+	mutex_lock(&v86dev->vq_lock[queue_id]);
+	err = virtqueue_add_sgs(vq, sgs, 1, 1, slot, GFP_KERNEL);
+	if (err) { mutex_unlock(&v86dev->vq_lock[queue_id]); return err; }
 	virtqueue_kick(vq);
-	wait_for_completion(&v86dev->req_done);
-	mutex_unlock(&v86dev->req_lock);
+	mutex_unlock(&v86dev->vq_lock[queue_id]);
+
+	wait_for_completion(&slot->done);
 	return 0;
+}
+
+/** v86fs_request_async - submit a request without waiting for completion.
+ *  Returns the tag on success, or negative errno on failure.
+ *  Caller must later call v86fs_request_wait() with the returned tag. */
+static int v86fs_request_async(struct v86fs_device *v86dev, int queue_id,
+			       void *req_buf, u32 req_len,
+			       void *resp_buf, u32 resp_len)
+{
+	struct virtqueue *vq = v86dev->vqs[queue_id];
+	struct scatterlist sg_out, sg_in;
+	struct scatterlist *sgs[2];
+	u16 tag;
+	struct v86fs_tag_slot *slot;
+	int err;
+
+	tag = v86fs_alloc_tag(v86dev);
+	slot = &v86dev->tags[tag];
+	slot->resp_buf = resp_buf;
+	slot->resp_len = resp_len;
+	reinit_completion(&slot->done);
+
+	((u8 *)req_buf)[5] = tag & 0xFF;
+	((u8 *)req_buf)[6] = (tag >> 8) & 0xFF;
+
+	sg_init_one(&sg_out, req_buf, req_len);
+	sg_init_one(&sg_in, resp_buf, resp_len);
+	sgs[0] = &sg_out; sgs[1] = &sg_in;
+
+	mutex_lock(&v86dev->vq_lock[queue_id]);
+	err = virtqueue_add_sgs(vq, sgs, 1, 1, slot, GFP_KERNEL);
+	if (err) { mutex_unlock(&v86dev->vq_lock[queue_id]); return err; }
+	virtqueue_kick(vq);
+	mutex_unlock(&v86dev->vq_lock[queue_id]);
+
+	return (int)tag;
+}
+
+/** v86fs_request_wait - wait for an async request to complete. */
+static void v86fs_request_wait(struct v86fs_device *v86dev, int tag)
+{
+	wait_for_completion(&v86dev->tags[tag].done);
 }
 
 static int v86fs_mount_request(struct v86fs_device *v86dev,
@@ -191,6 +268,7 @@ static const char *v86fs_get_link(struct dentry *, struct inode *, struct delaye
 static int v86fs_open(struct inode *, struct file *);
 static int v86fs_release(struct inode *, struct file *);
 static int v86fs_read_folio(struct file *, struct folio *);
+static void v86fs_readahead(struct readahead_control *);
 static int v86fs_writepages(struct address_space *, struct writeback_control *);
 static int v86fs_write_end(const struct kiocb *, struct address_space *, loff_t, unsigned, unsigned, struct folio *, void *);
 static int v86fs_fsync(struct file *, loff_t, loff_t, int);
@@ -217,19 +295,21 @@ static const struct file_operations v86fs_dir_fops = {
 static const struct file_operations v86fs_file_fops = {
 	.open = v86fs_open, .release = v86fs_release,
 	.read_iter = generic_file_read_iter, .write_iter = generic_file_write_iter,
+	.mmap = generic_file_mmap,
 	.fsync = v86fs_fsync, .llseek = generic_file_llseek,
 };
 static const struct address_space_operations v86fs_aops = {
-	.read_folio = v86fs_read_folio, .writepages = v86fs_writepages,
+	.read_folio = v86fs_read_folio, .readahead = v86fs_readahead,
+	.writepages = v86fs_writepages,
 	.write_begin = simple_write_begin, .write_end = v86fs_write_end,
 	.dirty_folio = filemap_dirty_folio,
 };
 
 static struct inode *v86fs_make_inode(struct super_block *sb, u64 ino, umode_t mode)
 {
-	struct inode *inode = new_inode(sb);
+	struct inode *inode = iget_locked(sb, ino);
 	if (!inode) return NULL;
-	inode->i_ino = ino;
+	if (!(inode_state_read_once(inode) & I_NEW)) return inode;
 	inode->i_mode = mode;
 	simple_inode_init_ts(inode);
 	switch (mode & S_IFMT) {
@@ -247,6 +327,7 @@ static struct inode *v86fs_make_inode(struct super_block *sb, u64 ino, umode_t m
 		inode->i_op = &v86fs_symlink_inode_ops;
 		break;
 	}
+	unlock_new_inode(inode);
 	return inode;
 }
 
@@ -449,6 +530,101 @@ static int v86fs_read_folio(struct file *file, struct folio *folio)
 fail:
 	folio_unlock(folio); kfree(req); kfree(resp);
 	return err ? err : -EIO;
+}
+
+#define V86FS_READAHEAD_MAX 32
+
+struct v86fs_ra_slot {
+	struct folio *folio;
+	u8 *req;
+	u8 *resp;
+	int tag;
+	size_t len;
+};
+
+static void v86fs_readahead(struct readahead_control *ractl)
+{
+	struct inode *inode = ractl->mapping->host;
+	struct v86fs_sb_info *sbi = inode->i_sb->s_fs_info;
+	struct v86fs_ra_slot slots[V86FS_READAHEAD_MAX];
+	u32 buf_size = PAGE_SIZE + 64;
+	int nr = 0, i;
+	struct folio *folio;
+
+	while ((folio = readahead_folio(ractl)) != NULL) {
+		loff_t pos = folio_pos(folio);
+		size_t len = folio_size(folio);
+		u8 *req, *resp;
+		int tag;
+
+		if (nr >= V86FS_READAHEAD_MAX)
+			break;
+
+		if (pos >= i_size_read(inode)) {
+			folio_zero_range(folio, 0, len);
+			folio_mark_uptodate(folio);
+			folio_unlock(folio);
+			continue;
+		}
+		if (pos + len > i_size_read(inode))
+			len = i_size_read(inode) - pos;
+
+		req = kmalloc(V86FS_HDR_SIZE + 20, GFP_KERNEL);
+		resp = kmalloc(buf_size, GFP_KERNEL);
+		if (!req || !resp) {
+			kfree(req); kfree(resp);
+			folio_unlock(folio);
+			continue;
+		}
+
+		v86fs_pack_header(req, V86FS_HDR_SIZE + 20, V86FS_MSG_READ, 0);
+		v86fs_pack_u64(&req[7], inode->i_ino);
+		v86fs_pack_u64(&req[15], pos);
+		v86fs_pack_u32(&req[23], len);
+		memset(resp, 0, buf_size);
+
+		tag = v86fs_request_async(sbi->v86dev, V86FS_VQ_REQUESTQ,
+					  req, V86FS_HDR_SIZE + 20,
+					  resp, buf_size);
+		if (tag < 0) {
+			kfree(req); kfree(resp);
+			folio_unlock(folio);
+			continue;
+		}
+
+		slots[nr].folio = folio;
+		slots[nr].req = req;
+		slots[nr].resp = resp;
+		slots[nr].tag = tag;
+		slots[nr].len = len;
+		nr++;
+	}
+
+	for (i = 0; i < nr; i++) {
+		u32 bytes_read;
+
+		v86fs_request_wait(sbi->v86dev, slots[i].tag);
+
+		if (slots[i].resp[4] != V86FS_MSG_READ_R ||
+		    v86fs_read_u32(&slots[i].resp[7]) != 0) {
+			folio_unlock(slots[i].folio);
+			goto free_slot;
+		}
+
+		bytes_read = v86fs_read_u32(&slots[i].resp[11]);
+		if (bytes_read > slots[i].len)
+			bytes_read = slots[i].len;
+		memcpy_to_folio(slots[i].folio, 0,
+				&slots[i].resp[15], bytes_read);
+		if (bytes_read < folio_size(slots[i].folio))
+			folio_zero_range(slots[i].folio, bytes_read,
+					 folio_size(slots[i].folio) - bytes_read);
+		folio_mark_uptodate(slots[i].folio);
+		folio_unlock(slots[i].folio);
+free_slot:
+		kfree(slots[i].req);
+		kfree(slots[i].resp);
+	}
 }
 
 static int v86fs_write_end(const struct kiocb *iocb, struct address_space *mapping,
@@ -746,6 +922,7 @@ static int v86fs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!root_inode) { kfree(sbi); return -ENOMEM; }
 	sb->s_root = d_make_root(root_inode);
 	if (!sb->s_root) { kfree(sbi); return -ENOMEM; }
+	v86fs_sb = sb;
 	return 0;
 }
 
@@ -770,7 +947,7 @@ static int v86fs_init_fs_context(struct fs_context *fc)
 }
 
 static void v86fs_kill_sb(struct super_block *sb)
-{ kill_anon_super(sb); kfree(sb->s_fs_info); }
+{ v86fs_sb = NULL; kill_anon_super(sb); kfree(sb->s_fs_info); }
 
 static struct file_system_type v86fs_type = {
 	.name = "v86fs", .init_fs_context = v86fs_init_fs_context,
@@ -780,9 +957,82 @@ static struct file_system_type v86fs_type = {
 /* Virtio device */
 static void v86fs_vq_done(struct virtqueue *vq)
 {
-	struct v86fs_device *v86dev = vq->vdev->priv;
-	unsigned int len; while (virtqueue_get_buf(vq, &len)) ;
-	complete(&v86dev->req_done);
+	unsigned int len;
+	struct v86fs_tag_slot *slot;
+
+	while ((slot = virtqueue_get_buf(vq, &len)) != NULL)
+		complete(&slot->done);
+}
+
+
+static void v86fs_notifyq_repost(struct virtqueue *vq, void *buf)
+{
+	struct scatterlist sg;
+	sg_init_one(&sg, buf, V86FS_NOTIFY_BUF_SIZE);
+	virtqueue_add_inbuf(vq, &sg, 1, buf, GFP_ATOMIC);
+}
+
+static void v86fs_notifyq_done(struct virtqueue *vq)
+{
+	struct super_block *sb = v86fs_sb;
+	unsigned int len;
+	void *buf;
+
+	while ((buf = virtqueue_get_buf(vq, &len))) {
+		u8 *msg = buf;
+		u8 type;
+		u64 ino;
+		struct inode *inode;
+
+		if (len < V86FS_HDR_SIZE + 8) goto repost;
+		type = msg[4];
+		ino = v86fs_read_u64(&msg[7]);
+		if (!sb) goto repost;
+
+		inode = ilookup(sb, ino);
+		if (!inode) goto repost;
+
+		switch (type) {
+		case V86FS_MSG_INVALIDATE:
+			if (len >= V86FS_HDR_SIZE + 8 + 8 + 8) {
+				u64 inv_off = v86fs_read_u64(&msg[15]);
+				u64 inv_size = v86fs_read_u64(&msg[23]);
+				if (inv_size > 0) {
+					pgoff_t pg_start = inv_off >> PAGE_SHIFT;
+					pgoff_t pg_end = (inv_off + inv_size - 1) >> PAGE_SHIFT;
+					invalidate_inode_pages2_range(inode->i_mapping,
+								     pg_start, pg_end);
+					break;
+				}
+			}
+			invalidate_inode_pages2(inode->i_mapping);
+			break;
+		case V86FS_MSG_INVALIDATE_DIR:
+			if (S_ISDIR(inode->i_mode)) {
+				struct dentry *dentry = d_find_any_alias(inode);
+				if (dentry) {
+					d_invalidate(dentry);
+					dput(dentry);
+				}
+			}
+			break;
+		}
+		iput(inode);
+repost:
+		v86fs_notifyq_repost(vq, buf);
+	}
+	virtqueue_kick(vq);
+}
+
+static void v86fs_notifyq_fill(struct virtqueue *vq)
+{
+	int i;
+	for (i = 0; i < V86FS_NOTIFY_BUF_COUNT; i++) {
+		void *buf = kzalloc(V86FS_NOTIFY_BUF_SIZE, GFP_KERNEL);
+		if (!buf) break;
+		v86fs_notifyq_repost(vq, buf);
+	}
+	virtqueue_kick(vq);
 }
 
 static int v86fs_probe(struct virtio_device *vdev)
@@ -795,17 +1045,24 @@ static int v86fs_probe(struct virtio_device *vdev)
 	v86dev = kzalloc(sizeof(*v86dev), GFP_KERNEL);
 	if (!v86dev) return -ENOMEM;
 	v86dev->vdev = vdev; vdev->priv = v86dev;
-	mutex_init(&v86dev->req_lock);
-	init_completion(&v86dev->req_done);
+	atomic_set(&v86dev->next_tag, 0);
+	{
+		int i;
+		for (i = 0; i < V86FS_VQ_MAX; i++)
+			mutex_init(&v86dev->vq_lock[i]);
+		for (i = 0; i < V86FS_TAG_COUNT; i++)
+			init_completion(&v86dev->tags[i].done);
+	}
 
 	vqs_info[0].callback = v86fs_vq_done; vqs_info[0].name = "hipriq";
 	vqs_info[1].callback = v86fs_vq_done; vqs_info[1].name = "requestq";
-	vqs_info[2].callback = v86fs_vq_done; vqs_info[2].name = "notifyq";
+	vqs_info[2].callback = v86fs_notifyq_done; vqs_info[2].name = "notifyq";
 	err = virtio_find_vqs(vdev, V86FS_VQ_MAX, vqs, vqs_info, NULL);
 	if (err) { kfree(v86dev); return err; }
 	v86dev->vqs[0] = vqs[0]; v86dev->vqs[1] = vqs[1]; v86dev->vqs[2] = vqs[2];
 
 	virtio_device_ready(vdev);
+	v86fs_notifyq_fill(vqs[2]);
 	v86fs_dev = v86dev;
 	pr_info("v86fs: probed, %d virtqueues ready\n", V86FS_VQ_MAX);
 	return 0;
