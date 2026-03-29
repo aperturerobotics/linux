@@ -252,6 +252,7 @@ static const struct file_operations v86fs_dir_fops = {
 static const struct file_operations v86fs_file_fops = {
 	.open = v86fs_open, .release = v86fs_release,
 	.read_iter = generic_file_read_iter, .write_iter = generic_file_write_iter,
+	.mmap = generic_file_mmap,
 	.fsync = v86fs_fsync, .llseek = generic_file_llseek,
 };
 static const struct address_space_operations v86fs_aops = {
