@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/statfs.h>
 #include <linux/jiffies.h>
+#include <linux/kmod.h>
 #include <linux/writeback.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
@@ -48,6 +49,8 @@
 /* Notifyq push messages (host -> guest) */
 #define V86FS_MSG_INVALIDATE     0x20
 #define V86FS_MSG_INVALIDATE_DIR 0x21
+#define V86FS_MSG_MOUNT_NOTIFY   0x22
+#define V86FS_MSG_UMOUNT_NOTIFY  0x23
 
 #define V86FS_MSG_MOUNT_R   0x80
 #define V86FS_MSG_LOOKUP_R  0x81
@@ -71,7 +74,7 @@
 #define V86FS_STATUS_ENOENT 2
 #define V86FS_HDR_SIZE      7
 
-#define V86FS_NOTIFY_BUF_SIZE 64
+#define V86FS_NOTIFY_BUF_SIZE 256
 #define V86FS_NOTIFY_BUF_COUNT 16
 
 #define V86FS_TAG_COUNT 256
@@ -972,6 +975,55 @@ static void v86fs_vq_done(struct virtqueue *vq)
 }
 
 
+/* Host-controlled mount work item */
+struct v86fs_mount_work {
+	struct work_struct work;
+	char name[NAME_MAX + 1];
+	char path[PATH_MAX];
+	bool is_umount;
+};
+
+static void v86fs_mount_work_fn(struct work_struct *work)
+{
+	struct v86fs_mount_work *mw = container_of(work, struct v86fs_mount_work, work);
+	char *envp[] = {"HOME=/", "PATH=/usr/bin:/usr/sbin:/bin:/sbin", NULL};
+
+	if (mw->is_umount) {
+		char *argv[] = {"/usr/bin/umount", mw->path, NULL};
+		int ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+		if (ret)
+			pr_warn("v86fs: umount %s failed: %d\n", mw->path, ret);
+		else
+			pr_info("v86fs: unmounted %s\n", mw->path);
+	} else {
+		char opts[NAME_MAX + 8];
+		char *mkdir_argv[] = {"/usr/bin/mkdir", "-p", mw->path, NULL};
+		char *mount_argv[8];
+		int ret;
+
+		ret = call_usermodehelper(mkdir_argv[0], mkdir_argv, envp, UMH_WAIT_PROC);
+		if (ret)
+			pr_warn("v86fs: mkdir %s failed: %d\n", mw->path, ret);
+
+		snprintf(opts, sizeof(opts), "name=%s", mw->name);
+		mount_argv[0] = "/usr/bin/mount";
+		mount_argv[1] = "-t";
+		mount_argv[2] = "v86fs";
+		mount_argv[3] = "none";
+		mount_argv[4] = mw->path;
+		mount_argv[5] = "-o";
+		mount_argv[6] = opts;
+		mount_argv[7] = NULL;
+		ret = call_usermodehelper(mount_argv[0], mount_argv, envp, UMH_WAIT_PROC);
+		if (ret)
+			pr_warn("v86fs: mount %s at %s failed: %d\n", mw->name, mw->path, ret);
+		else
+			pr_info("v86fs: mounted %s at %s\n", mw->name, mw->path);
+	}
+	kfree(mw);
+}
+
+
 static void v86fs_notifyq_repost(struct virtqueue *vq, void *buf)
 {
 	struct scatterlist sg;
@@ -991,8 +1043,58 @@ static void v86fs_notifyq_done(struct virtqueue *vq)
 		u64 ino;
 		struct inode *inode;
 
-		if (len < V86FS_HDR_SIZE + 8) goto repost;
+		if (len < V86FS_HDR_SIZE) goto repost;
 		type = msg[4];
+
+		/* Host-controlled mount messages (no inode needed) */
+		if (type == V86FS_MSG_MOUNT_NOTIFY) {
+			struct v86fs_mount_work *mw;
+			u16 nlen, plen;
+			int off = V86FS_HDR_SIZE;
+
+			if (len < (unsigned)(off + 4)) goto repost;
+			nlen = v86fs_read_u16(&msg[off]); off += 2;
+			if (nlen > NAME_MAX || len < (unsigned)(off + nlen + 2))
+				goto repost;
+			plen = v86fs_read_u16(&msg[off + nlen]);
+			if (plen > PATH_MAX - 1 ||
+			    len < (unsigned)(V86FS_HDR_SIZE + 2 + nlen + 2 + plen))
+				goto repost;
+
+			mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
+			if (!mw) goto repost;
+			memcpy(mw->name, &msg[V86FS_HDR_SIZE + 2], nlen);
+			mw->name[nlen] = 0;
+			memcpy(mw->path, &msg[V86FS_HDR_SIZE + 2 + nlen + 2], plen);
+			mw->path[plen] = 0;
+			mw->is_umount = false;
+			INIT_WORK(&mw->work, v86fs_mount_work_fn);
+			schedule_work(&mw->work);
+			goto repost;
+		}
+		if (type == V86FS_MSG_UMOUNT_NOTIFY) {
+			struct v86fs_mount_work *mw;
+			u16 plen;
+			int off = V86FS_HDR_SIZE;
+
+			if (len < (unsigned)(off + 2)) goto repost;
+			plen = v86fs_read_u16(&msg[off]);
+			if (plen > PATH_MAX - 1 ||
+			    len < (unsigned)(off + 2 + plen))
+				goto repost;
+
+			mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
+			if (!mw) goto repost;
+			memcpy(mw->path, &msg[off + 2], plen);
+			mw->path[plen] = 0;
+			mw->is_umount = true;
+			INIT_WORK(&mw->work, v86fs_mount_work_fn);
+			schedule_work(&mw->work);
+			goto repost;
+		}
+
+		/* Inode-targeted messages */
+		if (len < V86FS_HDR_SIZE + 8) goto repost;
 		ino = v86fs_read_u64(&msg[7]);
 		if (!sb) goto repost;
 
