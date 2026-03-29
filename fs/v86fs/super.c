@@ -14,6 +14,7 @@
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
+#include <linux/jiffies.h>
 #include <linux/writeback.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
@@ -884,9 +885,9 @@ static int v86fs_statfs(struct dentry *dentry, struct kstatfs *buf)
 }
 
 /* Mount infrastructure */
-enum v86fs_param { Opt_root };
+enum v86fs_param { Opt_name };
 static const struct fs_parameter_spec v86fs_param_spec[] = {
-	fsparam_string("root", Opt_root), {}
+	fsparam_string("name", Opt_name), {}
 };
 
 static int v86fs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -895,7 +896,7 @@ static int v86fs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	struct fs_parse_result result;
 	int opt = fs_parse(fc, v86fs_param_spec, param, &result);
 	if (opt < 0) return opt;
-	if (opt == Opt_root) { kfree(opts->root_name); opts->root_name = param->string; param->string = NULL; }
+	if (opt == Opt_name) { kfree(opts->root_name); opts->root_name = param->string; param->string = NULL; }
 	return 0;
 }
 
@@ -909,6 +910,12 @@ static int v86fs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
 	if (!sbi) return -ENOMEM;
+	/* Wait for virtio device probe (needed for root mount) */
+	{
+		unsigned long deadline = jiffies + 2 * HZ;
+		while (!v86fs_dev && time_before(jiffies, deadline))
+			schedule_timeout_interruptible(HZ / 10);
+	}
 	if (!v86fs_dev) { kfree(sbi); return -ENODEV; }
 	sbi->v86dev = v86fs_dev;
 	sb->s_maxbytes = MAX_LFS_FILESIZE; sb->s_blocksize = PAGE_SIZE;
