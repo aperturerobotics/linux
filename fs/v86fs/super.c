@@ -166,6 +166,48 @@ static int v86fs_request(struct v86fs_device *v86dev, int queue_id,
 	return 0;
 }
 
+/** v86fs_request_async - submit a request without waiting for completion.
+ *  Returns the tag on success, or negative errno on failure.
+ *  Caller must later call v86fs_request_wait() with the returned tag. */
+static int v86fs_request_async(struct v86fs_device *v86dev, int queue_id,
+			       void *req_buf, u32 req_len,
+			       void *resp_buf, u32 resp_len)
+{
+	struct virtqueue *vq = v86dev->vqs[queue_id];
+	struct scatterlist sg_out, sg_in;
+	struct scatterlist *sgs[2];
+	u16 tag;
+	struct v86fs_tag_slot *slot;
+	int err;
+
+	tag = v86fs_alloc_tag(v86dev);
+	slot = &v86dev->tags[tag];
+	slot->resp_buf = resp_buf;
+	slot->resp_len = resp_len;
+	reinit_completion(&slot->done);
+
+	((u8 *)req_buf)[5] = tag & 0xFF;
+	((u8 *)req_buf)[6] = (tag >> 8) & 0xFF;
+
+	sg_init_one(&sg_out, req_buf, req_len);
+	sg_init_one(&sg_in, resp_buf, resp_len);
+	sgs[0] = &sg_out; sgs[1] = &sg_in;
+
+	mutex_lock(&v86dev->vq_lock[queue_id]);
+	err = virtqueue_add_sgs(vq, sgs, 1, 1, slot, GFP_KERNEL);
+	if (err) { mutex_unlock(&v86dev->vq_lock[queue_id]); return err; }
+	virtqueue_kick(vq);
+	mutex_unlock(&v86dev->vq_lock[queue_id]);
+
+	return (int)tag;
+}
+
+/** v86fs_request_wait - wait for an async request to complete. */
+static void v86fs_request_wait(struct v86fs_device *v86dev, int tag)
+{
+	wait_for_completion(&v86dev->tags[tag].done);
+}
+
 static int v86fs_mount_request(struct v86fs_device *v86dev,
 			       const char *root_name,
 			       u64 *root_id, u32 *root_mode)
@@ -226,6 +268,7 @@ static const char *v86fs_get_link(struct dentry *, struct inode *, struct delaye
 static int v86fs_open(struct inode *, struct file *);
 static int v86fs_release(struct inode *, struct file *);
 static int v86fs_read_folio(struct file *, struct folio *);
+static void v86fs_readahead(struct readahead_control *);
 static int v86fs_writepages(struct address_space *, struct writeback_control *);
 static int v86fs_write_end(const struct kiocb *, struct address_space *, loff_t, unsigned, unsigned, struct folio *, void *);
 static int v86fs_fsync(struct file *, loff_t, loff_t, int);
@@ -256,7 +299,8 @@ static const struct file_operations v86fs_file_fops = {
 	.fsync = v86fs_fsync, .llseek = generic_file_llseek,
 };
 static const struct address_space_operations v86fs_aops = {
-	.read_folio = v86fs_read_folio, .writepages = v86fs_writepages,
+	.read_folio = v86fs_read_folio, .readahead = v86fs_readahead,
+	.writepages = v86fs_writepages,
 	.write_begin = simple_write_begin, .write_end = v86fs_write_end,
 	.dirty_folio = filemap_dirty_folio,
 };
@@ -486,6 +530,101 @@ static int v86fs_read_folio(struct file *file, struct folio *folio)
 fail:
 	folio_unlock(folio); kfree(req); kfree(resp);
 	return err ? err : -EIO;
+}
+
+#define V86FS_READAHEAD_MAX 32
+
+struct v86fs_ra_slot {
+	struct folio *folio;
+	u8 *req;
+	u8 *resp;
+	int tag;
+	size_t len;
+};
+
+static void v86fs_readahead(struct readahead_control *ractl)
+{
+	struct inode *inode = ractl->mapping->host;
+	struct v86fs_sb_info *sbi = inode->i_sb->s_fs_info;
+	struct v86fs_ra_slot slots[V86FS_READAHEAD_MAX];
+	u32 buf_size = PAGE_SIZE + 64;
+	int nr = 0, i;
+	struct folio *folio;
+
+	while ((folio = readahead_folio(ractl)) != NULL) {
+		loff_t pos = folio_pos(folio);
+		size_t len = folio_size(folio);
+		u8 *req, *resp;
+		int tag;
+
+		if (nr >= V86FS_READAHEAD_MAX)
+			break;
+
+		if (pos >= i_size_read(inode)) {
+			folio_zero_range(folio, 0, len);
+			folio_mark_uptodate(folio);
+			folio_unlock(folio);
+			continue;
+		}
+		if (pos + len > i_size_read(inode))
+			len = i_size_read(inode) - pos;
+
+		req = kmalloc(V86FS_HDR_SIZE + 20, GFP_KERNEL);
+		resp = kmalloc(buf_size, GFP_KERNEL);
+		if (!req || !resp) {
+			kfree(req); kfree(resp);
+			folio_unlock(folio);
+			continue;
+		}
+
+		v86fs_pack_header(req, V86FS_HDR_SIZE + 20, V86FS_MSG_READ, 0);
+		v86fs_pack_u64(&req[7], inode->i_ino);
+		v86fs_pack_u64(&req[15], pos);
+		v86fs_pack_u32(&req[23], len);
+		memset(resp, 0, buf_size);
+
+		tag = v86fs_request_async(sbi->v86dev, V86FS_VQ_REQUESTQ,
+					  req, V86FS_HDR_SIZE + 20,
+					  resp, buf_size);
+		if (tag < 0) {
+			kfree(req); kfree(resp);
+			folio_unlock(folio);
+			continue;
+		}
+
+		slots[nr].folio = folio;
+		slots[nr].req = req;
+		slots[nr].resp = resp;
+		slots[nr].tag = tag;
+		slots[nr].len = len;
+		nr++;
+	}
+
+	for (i = 0; i < nr; i++) {
+		u32 bytes_read;
+
+		v86fs_request_wait(sbi->v86dev, slots[i].tag);
+
+		if (slots[i].resp[4] != V86FS_MSG_READ_R ||
+		    v86fs_read_u32(&slots[i].resp[7]) != 0) {
+			folio_unlock(slots[i].folio);
+			goto free_slot;
+		}
+
+		bytes_read = v86fs_read_u32(&slots[i].resp[11]);
+		if (bytes_read > slots[i].len)
+			bytes_read = slots[i].len;
+		memcpy_to_folio(slots[i].folio, 0,
+				&slots[i].resp[15], bytes_read);
+		if (bytes_read < folio_size(slots[i].folio))
+			folio_zero_range(slots[i].folio, bytes_read,
+					 folio_size(slots[i].folio) - bytes_read);
+		folio_mark_uptodate(slots[i].folio);
+		folio_unlock(slots[i].folio);
+free_slot:
+		kfree(slots[i].req);
+		kfree(slots[i].resp);
+	}
 }
 
 static int v86fs_write_end(const struct kiocb *iocb, struct address_space *mapping,
@@ -855,6 +994,17 @@ static void v86fs_notifyq_done(struct virtqueue *vq)
 
 		switch (type) {
 		case V86FS_MSG_INVALIDATE:
+			if (len >= V86FS_HDR_SIZE + 8 + 8 + 8) {
+				u64 inv_off = v86fs_read_u64(&msg[15]);
+				u64 inv_size = v86fs_read_u64(&msg[23]);
+				if (inv_size > 0) {
+					pgoff_t pg_start = inv_off >> PAGE_SHIFT;
+					pgoff_t pg_end = (inv_off + inv_size - 1) >> PAGE_SHIFT;
+					invalidate_inode_pages2_range(inode->i_mapping,
+								     pg_start, pg_end);
+					break;
+				}
+			}
 			invalidate_inode_pages2(inode->i_mapping);
 			break;
 		case V86FS_MSG_INVALIDATE_DIR:
