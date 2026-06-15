@@ -307,6 +307,7 @@ static const struct address_space_operations v86fs_aops = {
 	.writepages = v86fs_writepages,
 	.write_begin = simple_write_begin, .write_end = v86fs_write_end,
 	.dirty_folio = filemap_dirty_folio,
+	.migrate_folio = filemap_migrate_folio,
 };
 
 static struct inode *v86fs_make_inode(struct super_block *sb, u64 ino, umode_t mode)
