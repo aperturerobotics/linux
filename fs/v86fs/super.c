@@ -704,6 +704,14 @@ static int v86fs_create(struct mnt_idmap *idmap, struct inode *dir,
 
 	inode = v86fs_make_inode(dir->i_sb, v86fs_read_u64(&resp[11]), v86fs_read_u32(&resp[19]));
 	if (!inode) return -ENOMEM;
+	/*
+	 * Own the new inode by the creating task. The host protocol carries no
+	 * uid/gid, so without this every inode defaults to root and an
+	 * unprivileged creator (e.g. apt's _apt download sandbox) gets -EPERM
+	 * from setattr_prepare on its own fchmod. Ownership is in-memory only
+	 * until the protocol round-trips uid/gid.
+	 */
+	inode_init_owner(idmap, inode, dir, inode->i_mode);
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -730,6 +738,7 @@ static struct dentry *v86fs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	inode = v86fs_make_inode(dir->i_sb, v86fs_read_u64(&resp[11]), v86fs_read_u32(&resp[19]));
 	if (!inode) return ERR_PTR(-ENOMEM);
+	inode_init_owner(idmap, inode, dir, inode->i_mode);
 	inc_nlink(dir);
 	d_instantiate(dentry, inode);
 	return NULL;
@@ -833,6 +842,7 @@ static int v86fs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	inode = v86fs_make_inode(dir->i_sb, v86fs_read_u64(&resp[11]), v86fs_read_u32(&resp[19]));
 	if (!inode) return -ENOMEM;
+	inode_init_owner(idmap, inode, dir, inode->i_mode);
 	d_instantiate(dentry, inode);
 	return 0;
 }
